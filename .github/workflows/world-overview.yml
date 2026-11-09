@@ -138,7 +138,7 @@ jobs:
           fi
           if [[ -z "$state" ]]; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
-              --title "GnssProbe world overview $SOURCE_DATE" --notes-file "$notes"
+              --title "TileDelta world overview $SOURCE_DATE" --notes-file "$notes"
           fi
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP/world-release/"*
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
