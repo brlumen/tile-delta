@@ -17,6 +17,10 @@ concurrency:
   group: world-overview
   cancel-in-progress: false
 
+env:
+  PMTILES_KEEP_RELEASES: '2'
+  PMTILES_BASE_HISTORY: '8'
+
 jobs:
   publish:
     runs-on: ubuntu-24.04
@@ -53,19 +57,29 @@ jobs:
           done
           [[ -n "$source_date" ]] || { echo 'No Protomaps build found' >&2; exit 1; }
           tag="world-pmtiles-$source_date"
-          published=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 8 --exclude-drafts \
-            --exclude-pre-releases --json tagName --jq '.[] | .tagName | select(test("^world-pmtiles-[0-9]{8}$"))')
-          latest=$(printf '%s\n' "$published" | sort -r | sed -n '1p')
+          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^world-pmtiles-[0-9]{8}$"))' \
+            | sort -ru)
+          latest=${published%%$'\n'*}
           if [[ -n "$latest" && ( "$tag" == "$latest" || "$tag" < "$latest" ) ]]; then
             echo "Overview is already at $latest"
             exit 0
           fi
           mkdir -p "$RUNNER_TEMP/world-bases"
+          if [[ -n "$latest" ]]; then
+            history=$(gh release view "$latest" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[] | select(.name == "world-base-indexes.zip") | .name')
+            if [[ -n "$history" ]]; then
+              gh release download "$latest" --repo "$GITHUB_REPOSITORY" --pattern world-base-indexes.zip \
+                --output "$RUNNER_TEMP/world-base-indexes.zip"
+              python3 -m zipfile -e "$RUNNER_TEMP/world-base-indexes.zip" "$RUNNER_TEMP/world-bases"
+            fi
+          fi
           while IFS= read -r previous; do
             [[ -n "$previous" ]] || continue
             gh release download "$previous" --repo "$GITHUB_REPOSITORY" --pattern world-index.pmi \
-              --output "$RUNNER_TEMP/world-bases/$previous.pmi"
-          done <<< "$published"
+              --output "$RUNNER_TEMP/world-bases/$previous.pmi" --clobber
+          done <<< "$(printf '%s\n' "$published" | sed -n "1,${PMTILES_BASE_HISTORY}p")"
           printf 'tag=%s\nsource_date=%s\n' "$tag" "$source_date" >> "$GITHUB_OUTPUT"
 
       - name: Build map and tile deltas
@@ -90,9 +104,16 @@ jobs:
           "$python" -B tools/world_roads.py "$RUNNER_TEMP/world.pmtiles" "$RUNNER_TEMP/world-roads.pmtiles"
           "$RUNNER_TEMP/pmtiles" verify "$RUNNER_TEMP/world-roads.pmtiles"
           shopt -s nullglob
-          bases=(seeds/*.pmi "$RUNNER_TEMP/world-bases/"*.pmi)
+          history=("$RUNNER_TEMP/world-bases/"world-pmtiles-????????.pmi)
+          if (( ${#history[@]} > PMTILES_BASE_HISTORY )); then
+            history=("${history[@]: -PMTILES_BASE_HISTORY}")
+          fi
+          bases=(seeds/*.pmi "${history[@]}")
           "$python" -B tools/world_road_release.py release "$RUNNER_TEMP/world-roads.pmtiles" \
             "$RUNNER_TEMP/world-release" "$TAG" "${bases[@]}"
+          if (( ${#history[@]} )); then
+            "$python" -m zipfile -c "$RUNNER_TEMP/world-release/world-base-indexes.zip" "${history[@]}"
+          fi
 
       - name: Publish complete release
         if: steps.source.outputs.tag != ''
@@ -121,3 +142,44 @@ jobs:
           fi
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP/world-release/"*
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Retain the newest PMTiles releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^world-pmtiles-[0-9]{8}$"))' \
+            | sort -ru)
+          latest=${published%%$'\n'*}
+          obsolete=$(printf '%s\n' "$published" | tail -n "+$((PMTILES_KEEP_RELEASES + 1))")
+          if [[ -z "$obsolete" ]]; then
+            echo "No old PMTiles releases to remove"
+            exit 0
+          fi
+
+          active=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          if [[ "$active" != "$latest" ]]; then
+            echo "Skipping cleanup while $active is marked latest instead of $latest"
+            exit 0
+          fi
+          while IFS= read -r retained; do
+            assets=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$retained" \
+              --jq '.assets[] | select(.state == "uploaded" and .size > 0) | .name')
+            for required in world-roads.pmtiles world-index.pmi world-release.json; do
+              if ! grep -Fxq "$required" <<< "$assets"; then
+                echo "$retained is missing $required" >&2
+                exit 1
+              fi
+            done
+            # Save the indexes in a new release before deleting their original releases.
+            if [[ "$retained" == "$latest" ]] && ! grep -Fxq world-base-indexes.zip <<< "$assets"; then
+              echo "Waiting for a release that includes the base index history"
+              exit 0
+            fi
+          done <<< "$(printf '%s\n' "$published" | sed -n "1,${PMTILES_KEEP_RELEASES}p")"
+
+          while IFS= read -r previous; do
+            gh release delete "$previous" --repo "$GITHUB_REPOSITORY" --yes
+          done <<< "$obsolete"
