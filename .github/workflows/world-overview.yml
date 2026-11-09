@@ -1,0 +1,122 @@
+name: Publish world overview
+
+on:
+  schedule:
+    - cron: '37 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      source_date:
+        description: Protomaps build date (YYYYMMDD). Leave blank for the latest available build.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: world-overview
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Select a new Protomaps build
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_DATE: ${{ inputs.source_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_DATE" ]]; then
+            [[ "$REQUESTED_DATE" =~ ^[0-9]{8}$ ]] || { echo 'Expected YYYYMMDD' >&2; exit 1; }
+            dates=("$REQUESTED_DATE")
+          else
+            dates=()
+            for offset in {0..6}; do dates+=("$(date -u -d "$offset days ago" +%Y%m%d)"); done
+          fi
+          source_date=''
+          for candidate in "${dates[@]}"; do
+            code=$(curl -sS --head --retry 2 --max-time 25 -o /dev/null -w '%{http_code}' \
+              "https://build.protomaps.com/$candidate.pmtiles")
+            case "$code" in
+              200) source_date="$candidate"; break ;;
+              404) ;;
+              *) echo "Protomaps returned HTTP $code" >&2; exit 1 ;;
+            esac
+          done
+          [[ -n "$source_date" ]] || { echo 'No Protomaps build found' >&2; exit 1; }
+          tag="world-$source_date"
+          published=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 8 --exclude-drafts \
+            --exclude-pre-releases --json tagName --jq '.[] | .tagName | select(test("^world-[0-9]{8}$"))')
+          latest=$(printf '%s\n' "$published" | sort -r | sed -n '1p')
+          if [[ -n "$latest" && ( "$tag" == "$latest" || "$tag" < "$latest" ) ]]; then
+            echo "Overview is already at $latest"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/world-bases"
+          while IFS= read -r previous; do
+            [[ -n "$previous" ]] || continue
+            gh release download "$previous" --repo "$GITHUB_REPOSITORY" --pattern world-index.gpi \
+              --output "$RUNNER_TEMP/world-bases/$previous.gpi"
+          done <<< "$published"
+          printf 'tag=%s\nsource_date=%s\n' "$tag" "$source_date" >> "$GITHUB_OUTPUT"
+
+      - name: Build map and tile deltas
+        if: steps.source.outputs.tag != ''
+        env:
+          SOURCE_DATE: ${{ steps.source.outputs.source_date }}
+          TAG: ${{ steps.source.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/pmtiles.tar.gz"
+          curl -fsSL --retry 3 --max-time 120 \
+            https://github.com/protomaps/go-pmtiles/releases/download/v1.31.2/go-pmtiles_1.31.2_Linux_x86_64.tar.gz \
+            -o "$archive"
+          printf '3ed7dbf4ec2e6dfe5e25b6f70d1ffc932729f93c86db353bf514dd71010a312f  %s\n' "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" pmtiles
+          python3 -m venv "$RUNNER_TEMP/world-venv"
+          python="$RUNNER_TEMP/world-venv/bin/python"
+          "$python" -m pip install --disable-pip-version-check pmtiles==3.8.1 mapbox-vector-tile==2.2.0
+          "$RUNNER_TEMP/pmtiles" extract "https://build.protomaps.com/$SOURCE_DATE.pmtiles" \
+            "$RUNNER_TEMP/world.pmtiles" --maxzoom=9
+          "$python" -B tools/world_roads.py "$RUNNER_TEMP/world.pmtiles" "$RUNNER_TEMP/world.gpw"
+          shopt -s nullglob
+          bases=(seeds/*.gpi "$RUNNER_TEMP/world-bases/"*.gpi)
+          "$python" -B tools/world_road_release.py release "$RUNNER_TEMP/world.gpw" \
+            "$RUNNER_TEMP/world-release" "$TAG" "${bases[@]}"
+
+      - name: Publish complete release
+        if: steps.source.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_DATE: ${{ steps.source.outputs.source_date }}
+          TAG: ${{ steps.source.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/world-notes.md"
+          cat > "$notes" <<EOF
+          World overview, zoom levels 0–9, from the [Protomaps build $SOURCE_DATE](https://maps.protomaps.com/builds/).
+
+          © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) · [ODbL](https://opendatacommons.org/licenses/odbl/1-0/) · [Protomaps](https://protomaps.com/)
+          EOF
+          state=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 20 --json tagName,isDraft \
+            --jq ".[] | select(.tagName == \"$TAG\") | .isDraft")
+          if [[ "$state" == false ]]; then
+            echo "Release $TAG is already published"
+            exit 0
+          fi
+          if [[ -z "$state" ]]; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --title "GnssProbe world overview $SOURCE_DATE" --notes-file "$notes"
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$RUNNER_TEMP/world-release/"*
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
