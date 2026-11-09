@@ -5,41 +5,19 @@ import argparse
 import functools
 import gzip
 import os
-import shutil
-import struct
-import tempfile
-import zlib
 from pathlib import Path
 
 from mapbox_vector_tile.decoder import TileData
+from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 from pmtiles.reader import all_tiles
-from pmtiles.tile import Compression, TileType, deserialize_header
+from pmtiles.tile import Compression, TileType, deserialize_header, zxy_to_tileid
+from pmtiles.writer import write
 
 EXTENT = 1024
-MAGIC = 0x47505731
+GROUPS = ("land", "boundaries", "primary", "trunk", "motorway")
 ROAD_GROUPS = {"primary": 2, "trunk": 3, "motorway": 4}
 LAYERS = {"earth", "boundaries", "roads", "places"}
 PROPERTIES = {"kind", "kind_detail", "name", "name:ru", "population", "ref", "shield_text"}
-
-
-def varint(value, output):
-    value = (value << 1) ^ (value >> 31)
-    while value >= 128:
-        output.append((value & 127) | 128)
-        value >>= 7
-    output.append(value)
-
-
-def parts(geometry):
-    coords = geometry["coordinates"]
-    match geometry["type"]:
-        case "LineString":
-            yield coords
-        case "MultiLineString" | "Polygon":
-            yield from coords
-        case "MultiPolygon":
-            for polygon in coords:
-                yield from polygon
 
 
 def quantized(line, extent, polygon):
@@ -68,28 +46,58 @@ def inside(x, y):
     return 0 <= x < EXTENT and 0 <= y < EXTENT
 
 
+def quantized_polygon(polygon, extent):
+    rings = []
+    for i, ring in enumerate(polygon):
+        points = quantized(ring, extent, True)
+        area = sum(x * yy - xx * y for (x, y), (xx, yy) in zip(points, points[1:] + points[:1]))
+        if area:
+            if (area > 0) != (i == 0):
+                points.reverse()
+            rings.append(points)
+        elif i == 0:
+            break
+    return rings
+
+
+def geometry(parts, polygon=False):
+    commands = []
+    last_x = last_y = 0
+    for points in parts:
+        commands.append(9)  # MoveTo(1)
+        for i, (x, y) in enumerate(points):
+            if i == 1:
+                commands.append(((len(points) - 1) << 3) | 2)  # LineTo
+            dx, dy = x - last_x, y - last_y
+            commands.extend(((dx << 1) ^ (dx >> 31), (dy << 1) ^ (dy >> 31)))
+            last_x, last_y = x, y
+        if polygon:
+            commands.append(15)  # ClosePath(1)
+    return commands
+
+
 def encode(groups, places, refs):
-    data = bytearray()
-    for group in groups:
-        data.extend(struct.pack(">H", len(group)))
-        for line in group:
-            data.extend(struct.pack(">H", len(line)))
-            last_x = last_y = 0
-            for x, y in line:
-                varint(x - last_x, data)
-                varint(y - last_y, data)
-                last_x, last_y = x, y
-    labels = []
-    for name, (_, point) in sorted(places.items(), key=lambda item: item[1][0], reverse=True)[:12]:
-        labels.append((False, *point, name))
-    for name, (_, point) in sorted(refs.items(), key=lambda item: item[1][0], reverse=True)[:12]:
-        labels.append((True, *point, name))
-    data.extend(struct.pack(">H", len(labels)))
-    for route, x, y, name in labels:
-        text = name.encode()
-        data.extend(struct.pack(">?HHB", route, x, y, len(text)))
-        data.extend(text)
-    return zlib.compress(data, 4)
+    tile = VectorTile()
+    for name, group in zip(GROUPS, groups):
+        if not group:
+            continue
+        layer = tile.layers.add(name=name, version=2, extent=EXTENT)
+        if name == "land":
+            for polygon in group:
+                layer.features.add(type=3, geometry=geometry(polygon, polygon=True))
+        else:
+            layer.features.add(type=2, geometry=geometry(group))
+    for layer_name, labels in (("places", places), ("road_labels", refs)):
+        if not labels:
+            continue
+        layer = tile.layers.add(name=layer_name, version=2, extent=EXTENT)
+        layer.keys.append("name")
+        for name, (_, point) in sorted(labels.items(), key=lambda item: item[1][0], reverse=True)[:12]:
+            layer.features.add(type=1, tags=(0, len(layer.values)), geometry=geometry([[point]]))
+            layer.values.add(string_value=name)
+    compressed = gzip.compress(tile.SerializeToString(), compresslevel=4, mtime=0)
+    # Python 3.11–3.12 can put a platform-specific OS byte in the gzip header.
+    return compressed[:9] + b"\xff" + compressed[10:]
 
 
 @functools.lru_cache(maxsize=256)
@@ -102,6 +110,16 @@ def tile(raw, zoom):
             continue
         keys = {i: name for i, name in enumerate(layer.keys) if name in PROPERTIES}
         for feature in layer.features:
+            if layer.name == "earth":
+                if feature.type != 3:
+                    continue
+                shape = source.parse_geometry(feature.geometry, feature.type, layer.extent, True, None)
+                polygons = [shape["coordinates"]] if shape["type"] == "Polygon" else shape["coordinates"]
+                for polygon in polygons:
+                    rings = quantized_polygon(polygon, layer.extent)
+                    if rings:
+                        groups[0].append(rings)
+                continue
             props = {keys[key]: source.parse_value(layer.values[val])
                      for key, val in zip(feature.tags[::2], feature.tags[1::2]) if key in keys}
             kind = props.get("kind")
@@ -118,9 +136,7 @@ def tile(raw, zoom):
                         priority = 10**10 if kind == "country" else int(props.get("population") or 0)
                         places[name] = max((priority, point), places.get(name, (0, point)))
                 continue
-            if layer.name == "earth":
-                group = 0
-            elif layer.name == "boundaries":
+            if layer.name == "boundaries":
                 if kind != "country":
                     continue
                 group = 1
@@ -129,10 +145,13 @@ def tile(raw, zoom):
                 group = ROAD_GROUPS.get(detail.removesuffix("_link"))
                 if group is None:
                     continue
-            geometry = source.parse_geometry(feature.geometry, feature.type, layer.extent, True, None)
+            if feature.type != 2:
+                continue
+            shape = source.parse_geometry(feature.geometry, feature.type, layer.extent, True, None)
+            lines = [shape["coordinates"]] if shape["type"] == "LineString" else shape["coordinates"]
             ref = (props.get("shield_text") or props.get("ref") or "").split(";", 1)[0].strip()
-            for line in parts(geometry):
-                points = quantized(line, layer.extent, group == 0)
+            for line in lines:
+                points = quantized(line, layer.extent, False)
                 if not points:
                     continue
                 groups[group].append(points)
@@ -146,40 +165,40 @@ def tile(raw, zoom):
 
 
 def build(source, target, max_zoom):
-    index = []
-    common = {}
-    with source.open("rb") as raw, tempfile.TemporaryFile() as payload:
-        read = lambda offset, length: os.pread(raw.fileno(), length, offset)
-        header = deserialize_header(read(0, 127))
-        if header["tile_type"] != TileType.MVT or header["tile_compression"] != Compression.GZIP:
-            raise ValueError("Expected a gzip-compressed Protomaps vector archive")
-        for (z, x, y), data in all_tiles(read):
-            if z > max_zoom:
-                break
-            data = tile(data, z)
-            if not data:
-                continue
-            offset = common.get(data) if len(data) < 64 else None
-            if offset is None:
-                offset = payload.tell()
-                payload.write(data)
-                if len(data) < 64:
-                    common[data] = offset
-            index.append(((z << 24) | (x << 12) | y, offset, len(data)))
-            if len(index) % 10_000 == 0:
-                print(f"z{z}: {len(index)} tiles, {payload.tell()/2**20:.1f} MiB", flush=True)
-        if not index or index[-1][0] >> 24 != max_zoom:
-            raise ValueError("Archive does not contain the requested zoom levels")
-        start = 12 + len(index) * 12
-        temp = target.with_suffix(".part")
-        with temp.open("wb") as output:
-            output.write(struct.pack(">III", MAGIC, max_zoom, len(index)))
-            for key, offset, length in sorted(index):
-                output.write(struct.pack(">III", key, start + offset, length))
-            payload.seek(0)
-            shutil.copyfileobj(payload, output)
+    temp = target.with_suffix(".part")
+    try:
+        with source.open("rb") as raw, write(temp) as output:
+            def read(offset, length):
+                return os.pread(raw.fileno(), length, offset)
+
+            header = deserialize_header(read(0, 127))
+            if header["tile_type"] != TileType.MVT or header["tile_compression"] != Compression.GZIP:
+                raise ValueError("Expected a gzip-compressed Protomaps vector archive")
+            last_zoom = -1
+            for (z, x, y), data in all_tiles(read):
+                if z > max_zoom:
+                    break
+                data = tile(data, z)
+                if data:
+                    output.write_tile(zxy_to_tileid(z, x, y), data)
+                    last_zoom = z
+                    if output.addressed_tiles % 10_000 == 0:
+                        print(f"z{z}: {output.addressed_tiles} tiles, {output.offset/2**20:.1f} MiB", flush=True)
+            if last_zoom != max_zoom:
+                raise ValueError("Archive does not contain the requested zoom levels")
+            output.finalize(
+                {"tile_type": TileType.MVT, "tile_compression": Compression.GZIP,
+                 "min_lat_e7": -850511288, "max_lat_e7": 850511288},
+                {"name": "GnssProbe world overview", "format": "pbf",
+                 "attribution": '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · Protomaps',
+                 "vector_layers": [{"id": name, "fields": {"name": "String"} if name in ("places", "road_labels") else {},
+                                    "minzoom": 6 if name == "road_labels" else 0, "maxzoom": max_zoom}
+                                   for name in (*GROUPS, "places", "road_labels")]},
+            )
         temp.replace(target)
-        print(f"{len(index)} tiles, {target.stat().st_size/2**20:.1f} MiB", flush=True)
+    finally:
+        temp.unlink(missing_ok=True)
+    print(f"{output.addressed_tiles} tiles, {target.stat().st_size/2**20:.1f} MiB", flush=True)
 
 
 if __name__ == "__main__":

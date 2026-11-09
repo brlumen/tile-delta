@@ -52,9 +52,9 @@ jobs:
             esac
           done
           [[ -n "$source_date" ]] || { echo 'No Protomaps build found' >&2; exit 1; }
-          tag="world-$source_date"
+          tag="world-pmtiles-$source_date"
           published=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 8 --exclude-drafts \
-            --exclude-pre-releases --json tagName --jq '.[] | .tagName | select(test("^world-[0-9]{8}$"))')
+            --exclude-pre-releases --json tagName --jq '.[] | .tagName | select(test("^world-pmtiles-[0-9]{8}$"))')
           latest=$(printf '%s\n' "$published" | sort -r | sed -n '1p')
           if [[ -n "$latest" && ( "$tag" == "$latest" || "$tag" < "$latest" ) ]]; then
             echo "Overview is already at $latest"
@@ -63,8 +63,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/world-bases"
           while IFS= read -r previous; do
             [[ -n "$previous" ]] || continue
-            gh release download "$previous" --repo "$GITHUB_REPOSITORY" --pattern world-index.gpi \
-              --output "$RUNNER_TEMP/world-bases/$previous.gpi"
+            gh release download "$previous" --repo "$GITHUB_REPOSITORY" --pattern world-index.pmi \
+              --output "$RUNNER_TEMP/world-bases/$previous.pmi"
           done <<< "$published"
           printf 'tag=%s\nsource_date=%s\n' "$tag" "$source_date" >> "$GITHUB_OUTPUT"
 
@@ -87,10 +87,11 @@ jobs:
           "$python" -m pip install --disable-pip-version-check pmtiles==3.8.1 mapbox-vector-tile==2.2.0
           "$RUNNER_TEMP/pmtiles" extract "https://build.protomaps.com/$SOURCE_DATE.pmtiles" \
             "$RUNNER_TEMP/world.pmtiles" --maxzoom=9
-          "$python" -B tools/world_roads.py "$RUNNER_TEMP/world.pmtiles" "$RUNNER_TEMP/world.gpw"
+          "$python" -B tools/world_roads.py "$RUNNER_TEMP/world.pmtiles" "$RUNNER_TEMP/world-roads.pmtiles"
+          "$RUNNER_TEMP/pmtiles" verify "$RUNNER_TEMP/world-roads.pmtiles"
           shopt -s nullglob
-          bases=(seeds/*.gpi "$RUNNER_TEMP/world-bases/"*.gpi)
-          "$python" -B tools/world_road_release.py release "$RUNNER_TEMP/world.gpw" \
+          bases=(seeds/*.pmi "$RUNNER_TEMP/world-bases/"*.pmi)
+          "$python" -B tools/world_road_release.py release "$RUNNER_TEMP/world-roads.pmtiles" \
             "$RUNNER_TEMP/world-release" "$TAG" "${bases[@]}"
 
       - name: Publish complete release
@@ -104,7 +105,7 @@ jobs:
           set -euo pipefail
           notes="$RUNNER_TEMP/world-notes.md"
           cat > "$notes" <<EOF
-          World overview, zoom levels 0–9, from the [Protomaps build $SOURCE_DATE](https://maps.protomaps.com/builds/).
+          PMTiles v3 world overview with MVT tiles, zoom levels 0–9, from the [Protomaps build $SOURCE_DATE](https://maps.protomaps.com/builds/).
 
           © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) · [ODbL](https://opendatacommons.org/licenses/odbl/1-0/) · [Protomaps](https://protomaps.com/)
           EOF
