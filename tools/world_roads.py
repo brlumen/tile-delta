@@ -189,8 +189,10 @@ def build(source, target, max_zoom):
             output.finalize(
                 {"tile_type": TileType.MVT, "tile_compression": Compression.GZIP,
                  "min_lat_e7": -850511288, "max_lat_e7": 850511288},
-                {"name": "GnssProbe world overview", "format": "pbf",
-                 "attribution": '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · Protomaps',
+                {"name": "TileDelta world overview", "format": "pbf",
+                 "license": "https://opendatacommons.org/licenses/odbl/1-0/",
+                 "attribution": '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
+                                ' · <a href="https://protomaps.com/">Protomaps</a>',
                  "vector_layers": [{"id": name, "fields": {"name": "String"} if name in ("places", "road_labels") else {},
                                     "minzoom": 6 if name == "road_labels" else 0, "maxzoom": max_zoom}
                                    for name in (*GROUPS, "places", "road_labels")]},

@@ -129,6 +129,8 @@ jobs:
           PMTiles v3 world overview with MVT tiles, zoom levels 0–9, from the [Protomaps build $SOURCE_DATE](https://maps.protomaps.com/builds/).
 
           © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) · [ODbL](https://opendatacommons.org/licenses/odbl/1-0/) · [Protomaps](https://protomaps.com/)
+
+          [Data licenses and attribution](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/DATA-LICENSE.md)
           EOF
           state=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 20 --json tagName,isDraft \
             --jq ".[] | select(.tagName == \"$TAG\") | .isDraft")
